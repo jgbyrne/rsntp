@@ -6,6 +6,16 @@ be running on the system instead. It periodically updates its state to mirror
 the real NTP client/server and uses multiple threads to serve the current
 system time.
 
+'''
+
+=== rsntp for timezone warping
+
+This version of rsntp has been modified to offset the broadcast UTC timestamp
+by the system timezone. This is, in general, a very bad idea, and is done here
+to solve a specific technical problem. You probably do not want to do this!
+
+'''
+
 By default, +rsntp+ uses one thread for IPv4 and another for IPv6. In order to
 get the best performance, it's necessary to increase the number of threads
 using the +--ipv4-threads+ and +--ipv6-threads+ options to correspond to the
