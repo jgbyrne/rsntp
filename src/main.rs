@@ -14,27 +14,33 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 extern crate byteorder;
+extern crate chrono;
 extern crate getopts;
 extern crate net2;
-extern crate rand;
 extern crate privdrop;
+extern crate rand;
 
-use std::thread;
 use std::env;
 use std::io;
 use std::io::{Error, ErrorKind};
-use std::net::{UdpSocket, SocketAddr};
-use std::time::{SystemTime, Duration};
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 use byteorder::{BigEndian, ByteOrder};
-
+use chrono::Offset;
 use getopts::Options;
 
-use net2::UdpBuilder;
 use net2::unix::UnixUdpBuilderExt;
+use net2::UdpBuilder;
 
 use rand::random;
+
+fn get_current_tz_offset() -> i64 {
+    let secs = chrono::Local::now().offset().fix().local_minus_utc() as i64;
+    (secs * 4294967296) as i64
+}
 
 #[derive(Debug, Copy, Clone)]
 struct NtpTimestamp {
@@ -42,21 +48,33 @@ struct NtpTimestamp {
 }
 
 impl NtpTimestamp {
-    fn now() -> NtpTimestamp {
+    fn true_now() -> NtpTimestamp {
         let now = SystemTime::now();
         let dur = now.duration_since(std::time::UNIX_EPOCH).unwrap();
         let secs = dur.as_secs() + 2208988800; // 1900 epoch
         let nanos = dur.subsec_nanos();
 
-        NtpTimestamp{ts: (secs << 32) + (nanos as f64 * 4.294967296) as u64}
+        NtpTimestamp {
+            ts: (secs << 32) + (nanos as f64 * 4.294967296) as u64,
+        }
+    }
+
+    fn with_tz(self, tz_offset: i64) -> NtpTimestamp {
+        let mut now = Self::true_now();
+        if tz_offset < 0 {
+            now.ts -= tz_offset.abs() as u64;
+        } else {
+            now.ts += tz_offset.abs() as u64;
+        }
+        now
     }
 
     fn zero() -> NtpTimestamp {
-        NtpTimestamp{ts: 0}
+        NtpTimestamp { ts: 0 }
     }
 
     fn random() -> NtpTimestamp {
-        NtpTimestamp{ts: random()}
+        NtpTimestamp { ts: random() }
     }
 
     fn diff_to_sec(&self, ts: &NtpTimestamp) -> f64 {
@@ -64,7 +82,9 @@ impl NtpTimestamp {
     }
 
     fn read(buf: &[u8]) -> NtpTimestamp {
-        NtpTimestamp{ts: BigEndian::read_u64(buf)}
+        NtpTimestamp {
+            ts: BigEndian::read_u64(buf),
+        }
     }
 
     fn write(&self, buf: &mut [u8]) {
@@ -85,7 +105,9 @@ struct NtpFracValue {
 
 impl NtpFracValue {
     fn read(buf: &[u8]) -> NtpFracValue {
-        NtpFracValue{val: BigEndian::read_u32(buf)}
+        NtpFracValue {
+            val: BigEndian::read_u32(buf),
+        }
     }
 
     fn write(&self, buf: &mut [u8]) {
@@ -93,7 +115,7 @@ impl NtpFracValue {
     }
 
     fn zero() -> NtpFracValue {
-        NtpFracValue{val: 0}
+        NtpFracValue { val: 0 }
     }
 
     fn increment(&mut self) {
@@ -127,8 +149,6 @@ impl NtpPacket {
 
         let (len, addr) = socket.recv_from(&mut buf)?;
 
-        let local_ts = NtpTimestamp::now();
-
         if len < 48 {
             return Err(Error::new(ErrorKind::UnexpectedEof, "Packet too short"));
         }
@@ -141,9 +161,9 @@ impl NtpPacket {
             return Err(Error::new(ErrorKind::Other, "Unsupported version"));
         }
 
-        Ok(NtpPacket{
+        Ok(NtpPacket {
             remote_addr: addr,
-            local_ts: local_ts,
+            local_ts: NtpTimestamp::true_now(),
             leap: leap,
             version: version,
             mode: mode,
@@ -179,8 +199,9 @@ impl NtpPacket {
     }
 
     fn is_request(&self) -> bool {
-        self.mode == 1 || self.mode == 3 ||
-            (self.mode == 0 && self.version == 1 && self.remote_addr.port() != 123)
+        self.mode == 1
+            || self.mode == 3
+            || (self.mode == 0 && self.version == 1 && self.remote_addr.port() != 123)
     }
 
     fn make_response(&self, state: &NtpServerState) -> Option<NtpPacket> {
@@ -188,10 +209,11 @@ impl NtpPacket {
             return None;
         }
 
-        Some(NtpPacket{
+        Some(NtpPacket {
             remote_addr: self.remote_addr,
             local_ts: NtpTimestamp::zero(),
-            leap: state.leap,
+            /* pretty sure our tz offsets will wreak havoc with leap seconds so let's pretend they don't happen */
+            leap: 0,
             version: self.version,
             mode: if self.mode == 1 { 2 } else { 4 },
             stratum: state.stratum,
@@ -200,17 +222,17 @@ impl NtpPacket {
             delay: state.delay,
             dispersion: state.dispersion,
             ref_id: state.ref_id,
-            ref_ts: state.ref_ts,
-            orig_ts: self.tx_ts,
-            rx_ts: self.local_ts,
-            tx_ts: NtpTimestamp::now(),
+            ref_ts: state.ref_ts.with_tz(state.tz_offset),
+            orig_ts: self.tx_ts.with_tz(state.tz_offset),
+            rx_ts: self.local_ts.with_tz(state.tz_offset),
+            tx_ts: self.tx_ts.with_tz(state.tz_offset),
         })
     }
 
-    fn new_request(remote_addr: SocketAddr) -> NtpPacket {
-        NtpPacket{
+    fn client_request(remote_addr: SocketAddr) -> NtpPacket {
+        NtpPacket {
             remote_addr: remote_addr,
-            local_ts: NtpTimestamp::now(),
+            local_ts: NtpTimestamp::true_now(),
             leap: 0,
             version: 4,
             mode: 3,
@@ -228,13 +250,13 @@ impl NtpPacket {
     }
 
     fn is_valid_response(&self, request: &NtpPacket) -> bool {
-        self.remote_addr == request.remote_addr &&
-            self.mode == request.mode + 1 &&
-            self.orig_ts == request.tx_ts
+        self.remote_addr == request.remote_addr
+            && self.mode == request.mode + 1
+            && self.orig_ts == request.tx_ts
     }
 
-    fn get_server_state(&self) -> NtpServerState {
-        NtpServerState{
+    fn get_server_state(&self, tz_offset: i64) -> NtpServerState {
+        NtpServerState {
             leap: self.leap,
             stratum: self.stratum,
             precision: self.precision,
@@ -242,11 +264,13 @@ impl NtpPacket {
             ref_ts: self.ref_ts,
             dispersion: self.dispersion,
             delay: self.delay,
+            tz_offset,
         }
     }
 }
 
 #[derive(Copy, Clone)]
+#[allow(unused)]
 struct NtpServerState {
     leap: u8,
     stratum: u8,
@@ -255,6 +279,7 @@ struct NtpServerState {
     ref_ts: NtpTimestamp,
     dispersion: NtpFracValue,
     delay: NtpFracValue,
+    tz_offset: i64,
 }
 
 struct NtpServer {
@@ -265,8 +290,17 @@ struct NtpServer {
 }
 
 impl NtpServer {
-    fn new(local_addrs: Vec<String>, server_addr: String, debug: bool) -> NtpServer {
-        let state = NtpServerState{
+    fn new(
+        addr4: String,
+        addr6: String,
+        num4: usize,
+        num6: usize,
+        server_addr: String,
+        debug: bool,
+    ) -> NtpServer {
+        let tz_offset = get_current_tz_offset();
+
+        let state = NtpServerState {
             leap: 0,
             stratum: 0,
             precision: 0,
@@ -274,41 +308,54 @@ impl NtpServer {
             ref_ts: NtpTimestamp::zero(),
             dispersion: NtpFracValue::zero(),
             delay: NtpFracValue::zero(),
+            tz_offset,
         };
 
         let mut sockets = vec![];
 
-        for addr in local_addrs {
-            let sockaddr = addr.parse().unwrap();
+        if num4 != 0 {
+            let addr4: SocketAddr = addr4.parse().unwrap();
+            let udp_builder = UdpBuilder::new_v4().unwrap();
 
-            let udp_builder = match sockaddr {
-                SocketAddr::V4(_) => UdpBuilder::new_v4().unwrap(),
-                SocketAddr::V6(_) => UdpBuilder::new_v6().unwrap(),
-            };
-
-            let udp_builder_ref = match sockaddr {
-                SocketAddr::V4(_) => &udp_builder,
-                SocketAddr::V6(_) => udp_builder.only_v6(true).unwrap(),
-            };
-
-            let socket = match udp_builder_ref.reuse_port(true).unwrap().bind(sockaddr) {
-                Ok(s) => s,
-                Err(e) => panic!("Couldn't bind socket: {}", e)
-            };
-
-            sockets.push(socket);
+            for _ in 0..num4 {
+                let sock = match (&udp_builder).reuse_port(true).unwrap().bind(&addr4) {
+                    Ok(s) => s,
+                    Err(e) => panic!("Couldn't bind ipv4 socket: {}", e),
+                };
+                sockets.push(sock);
+            }
         }
 
-        NtpServer{
+        if num6 != 0 {
+            let addr6: SocketAddr = addr6.parse().unwrap();
+            let udp_builder = UdpBuilder::new_v6().unwrap();
+
+            udp_builder.only_v6(true).unwrap();
+
+            for _ in 0..num6 {
+                let sock = match (&udp_builder).reuse_port(true).unwrap().bind(&addr6) {
+                    Ok(s) => s,
+                    Err(e) => panic!("Couldn't bind ipv6 socket: {}", e),
+                };
+                sockets.push(sock);
+            }
+        }
+
+        NtpServer {
             state: Arc::new(Mutex::new(state)),
-            sockets: sockets,
-            server_addr: server_addr,
-            debug: debug,
+            sockets,
+            server_addr,
+            debug,
         }
     }
 
-    fn process_requests(thread_id: u32, debug: bool, socket: UdpSocket, state: Arc<Mutex<NtpServerState>>) {
-        let mut last_update = NtpTimestamp::now();
+    fn process_requests(
+        thread_id: u32,
+        debug: bool,
+        socket: UdpSocket,
+        state: Arc<Mutex<NtpServerState>>,
+    ) {
+        let mut last_update = NtpTimestamp::true_now();
         let mut cached_state: NtpServerState;
         cached_state = *state.lock().unwrap();
 
@@ -330,29 +377,29 @@ impl NtpServer {
                     }
 
                     match request.make_response(&cached_state) {
-                        Some(response) => {
-                            match response.send(&socket) {
-                                Ok(_) => {
-                                    if debug {
-                                        println!("Thread #{} sent {:?}", thread_id, response);
-                                    }
-                                },
-                                Err(e) => println!("Thread #{} failed to send packet to {}: {}",
-                                                   thread_id, response.remote_addr, e)
+                        Some(response) => match response.send(&socket) {
+                            Ok(_) => {
+                                if debug {
+                                    println!("Thread #{} sent {:?}", thread_id, response);
+                                }
                             }
+                            Err(e) => println!(
+                                "Thread #{} failed to send packet to {}: {}",
+                                thread_id, response.remote_addr, e
+                            ),
                         },
                         None => {}
                     }
-                },
+                }
                 Err(e) => {
                     println!("Thread #{} failed to receive packet: {}", thread_id, e);
-                },
+                }
             }
         }
     }
 
     fn update_state(state: Arc<Mutex<NtpServerState>>, addr: SocketAddr, debug: bool) {
-        let request = NtpPacket::new_request(addr);
+        let request = NtpPacket::client_request(addr);
         let mut new_state: Option<NtpServerState> = None;
         let socket = match addr {
             SocketAddr::V4(_) => UdpBuilder::new_v4().unwrap().bind("0.0.0.0:0").unwrap(),
@@ -364,9 +411,9 @@ impl NtpServer {
         match request.send(&socket) {
             Ok(_) => {
                 if debug {
-                    println!("Client sent {:?}", request);
+                    println!("Client ({:?}) sent {:?}", &socket, request);
                 }
-            },
+            }
             Err(e) => {
                 println!("Client failed to send packet: {}", e);
                 return;
@@ -386,7 +433,7 @@ impl NtpServer {
                     }
 
                     packet
-                },
+                }
                 Err(e) => {
                     if debug {
                         println!("Client failed to receive packet: {}", e);
@@ -395,7 +442,9 @@ impl NtpServer {
                 }
             };
 
-            new_state = Some(response.get_server_state());
+            let tz_offset = get_current_tz_offset();
+
+            new_state = Some(response.get_server_state(tz_offset));
             break;
         }
 
@@ -419,13 +468,19 @@ impl NtpServer {
             let debug = self.debug;
             let cloned_socket = socket.try_clone().unwrap();
 
-            threads.push(thread::spawn(move || {NtpServer::process_requests(id, debug, cloned_socket, state); }));
+            threads.push(thread::spawn(move || {
+                NtpServer::process_requests(id, debug, cloned_socket, state);
+            }));
         }
 
-        while ! quit {
-            NtpServer::update_state(self.state.clone(), self.server_addr.parse().unwrap(), self.debug);
+        while !quit {
+            NtpServer::update_state(
+                self.state.clone(),
+                self.server_addr.parse().unwrap(),
+                self.debug,
+            );
 
-            thread::sleep(Duration::new(1, 0));
+            thread::sleep(Duration::new(10, 0));
         }
 
         for thread in threads {
@@ -441,14 +496,38 @@ fn print_usage(opts: Options) {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let mut addrs = Vec::new();
     let mut opts = Options::new();
 
-    opts.optopt("4", "ipv4-threads", "set number of IPv4 server threads (1)", "NUM");
-    opts.optopt("6", "ipv6-threads", "set number of IPv6 server threads (1)", "NUM");
-    opts.optopt("a", "ipv4-address", "set local address of IPv4 server sockets (0.0.0.0:123)", "ADDR:PORT");
-    opts.optopt("b", "ipv6-address", "set local address of IPv6 server sockets ([::]:123)", "ADDR:PORT");
-    opts.optopt("s", "server-address", "set server address (127.0.0.1:11123)", "ADDR:PORT");
+    opts.optopt(
+        "4",
+        "ipv4-threads",
+        "set number of IPv4 server threads (1)",
+        "NUM",
+    );
+    opts.optopt(
+        "6",
+        "ipv6-threads",
+        "set number of IPv6 server threads (0)",
+        "NUM",
+    );
+    opts.optopt(
+        "a",
+        "ipv4-address",
+        "set local address of IPv4 server sockets (0.0.0.0:123)",
+        "ADDR:PORT",
+    );
+    opts.optopt(
+        "b",
+        "ipv6-address",
+        "set local address of IPv6 server sockets ([::]:123)",
+        "ADDR:PORT",
+    );
+    opts.optopt(
+        "s",
+        "server-address",
+        "set server address (127.0.0.1:11123)",
+        "ADDR:PORT",
+    );
     opts.optopt("u", "user", "run as USER", "USER");
     opts.optopt("r", "root", "change root directory", "DIR");
     opts.optflag("d", "debug", "Enable debug messages");
@@ -468,28 +547,41 @@ fn main() {
         return;
     }
 
-    let server_addr = matches.opt_str("s").unwrap_or("127.0.0.1:11123".to_string());
-    let n4 = matches.opt_str("4").unwrap_or("1".to_string()).parse().unwrap_or(1);
-    let n6 = matches.opt_str("6").unwrap_or("1".to_string()).parse().unwrap_or(1);
+    let server_addr = matches
+        .opt_str("s")
+        .unwrap_or("127.0.0.1:11123".to_string());
+    let n4 = matches
+        .opt_str("4")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(1);
+    let n6 = matches
+        .opt_str("6")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    if n4 == 0 && n6 == 0 {
+        println!("Zero threads specified");
+        return;
+    }
+
     let local_address4 = matches.opt_str("a").unwrap_or("0.0.0.0:123".to_string());
     let local_address6 = matches.opt_str("b").unwrap_or("[::]:123".to_string());
 
-    for _ in 0..n4 {
-        addrs.push(local_address4.clone());
-    }
-
-    for _ in 0..n6 {
-        addrs.push(local_address6.clone());
-    }
-
-    let server = NtpServer::new(addrs, server_addr, matches.opt_present("d"));
+    let server = NtpServer::new(
+        local_address4,
+        local_address6,
+        n4,
+        n6,
+        server_addr,
+        matches.opt_present("d"),
+    );
 
     if matches.opts_present(&["r".to_string(), "u".to_string()]) {
         privdrop::PrivDrop::default()
             .chroot(matches.opt_str("r").unwrap_or("/".to_string()))
             .user(&matches.opt_str("u").unwrap_or("root".to_string()))
             .apply()
-            .unwrap_or_else(|e| { panic!("Couldn't drop privileges: {}", e) });
+            .unwrap_or_else(|e| panic!("Couldn't drop privileges: {}", e));
     }
 
     server.run();
